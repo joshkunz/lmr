@@ -14,7 +14,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"sync"
 	"sync/atomic"
 
 	"github.com/spf13/cobra"
@@ -27,12 +26,24 @@ type mapResult struct {
 }
 
 type MapStage struct {
-	ID  string
-	Dir string
+	ID         string
+	Dir        string
+	ResultsDir string
+}
+
+func (m *MapStage) init() error {
+	if err := os.Mkdir(m.Dir, 0o777); err != nil {
+		return fmt.Errorf("failed to create map stage: %w", err)
+	}
+	m.ResultsDir = filepath.Join(m.Dir, "results")
+	if err := os.Mkdir(m.ResultsDir, 0o777); err != nil {
+		return fmt.Errorf("failed to create results directory: %w", err)
+	}
+	return nil
 }
 
 func (m MapStage) CollectResults() ([]mapResult, error) {
-	dirents, err := os.ReadDir(m.Dir)
+	dirents, err := os.ReadDir(m.ResultsDir)
 	if err != nil {
 		return nil, err
 	}
@@ -46,103 +57,118 @@ func (m MapStage) CollectResults() ([]mapResult, error) {
 
 		out = append(out, mapResult{
 			Key:  dent.Name(),
-			Path: filepath.Join(m.Dir, dent.Name()),
+			Path: filepath.Join(m.ResultsDir, dent.Name()),
 		})
 	}
 
 	return out, nil
 }
 
+type execFunc func(context.Context, ...string) *exec.Cmd
+
+func parseExec(prog string) (execFunc, error) {
+	if _, err := exec.LookPath(prog); err == nil {
+		// this is a binary on path
+		return func(ctx context.Context, extraArgs ...string) *exec.Cmd {
+			return exec.CommandContext(ctx, prog, extraArgs...)
+		}, nil
+	}
+
+	stat, err := os.Stat(prog)
+	if err == nil && (stat.Mode() == 0 || stat.Mode() == fs.ModeSymlink) {
+		// this is *probably* an executable
+		// TODO: Should we try to tell if this is actually executable?
+		// maybe even has at least some executable set?
+		path, err := filepath.Abs(prog)
+		if err != nil {
+			return nil, err
+		}
+		return func(ctx context.Context, extraArgs ...string) *exec.Cmd {
+			return exec.CommandContext(ctx, path, extraArgs...)
+		}, nil
+	}
+
+	// Otherwise, assume this is a valid shell command
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		return nil, fmt.Errorf("SHELL unset and mapper does not appear to be an executable")
+	}
+	return func(ctx context.Context, extraArgs ...string) *exec.Cmd {
+		args := []string{"-c", prog}
+		if len(extraArgs) > 0 {
+			// If we need any extra args, we need to pre-pend "--" so they
+			// are intepreted as script args rather than shell args.
+			args = append(args, "--")
+			args = append(args, extraArgs...)
+		}
+
+		return exec.CommandContext(ctx, shell, args...)
+	}, nil
+}
+
 type mapFunc func(ctx context.Context, stage MapStage, chunk []byte) ([]mapResult, error)
 
-type lazyFile struct {
-	name string
-
-	once   sync.Once
-	f      *os.File
-	poison error
+type execMapperOptions struct {
+	DefaultKey string
 }
 
-func (l *lazyFile) Exists() bool {
-	return l.poison == nil && l.f != nil
+type execMapperOption func(*execMapperOptions)
+
+func execWithDefaultKey(key string) execMapperOption {
+	return func(o *execMapperOptions) {
+		o.DefaultKey = key
+	}
 }
 
-func (l *lazyFile) Close() error {
-	if l.poison != nil {
-		return l.poison
-	}
-	if l.f == nil {
-		return nil
-	}
-	return l.f.Close()
+func execWithNoDefaultKey() execMapperOption {
+	// key "" is a special key that disables default output.
+	return execWithDefaultKey("")
 }
 
-func (l *lazyFile) Write(bs []byte) (int, error) {
-	l.once.Do(func() {
-		l.f, l.poison = os.Create(l.name)
-	})
-	if l.poison != nil {
-		return 0, l.poison
+func execMapper(fun execFunc, opts ...execMapperOption) mapFunc {
+	options := execMapperOptions{
+		DefaultKey: "default",
 	}
-	// l.f is guaranteed to be non-nil at this point
-	return l.f.Write(bs)
-}
-
-func execMapper(prog string) (mapFunc, error) {
-	base, err := func() (func(ctx context.Context) *exec.Cmd, error) {
-		if _, err := exec.LookPath(prog); err == nil {
-			// this is a binary on path
-			return func(ctx context.Context) *exec.Cmd {
-				return exec.CommandContext(ctx, prog)
-			}, nil
-		}
-
-		stat, err := os.Stat(prog)
-		if err == nil && (stat.Mode() == 0 || stat.Mode() == fs.ModeSymlink) {
-			// this is probably an executable
-			// TODO: Should we try to tell if this is actually executable?
-			// maybe even has at least some executable set?
-			path, err := filepath.Abs(prog)
-			if err != nil {
-				return nil, err
-			}
-			return func(ctx context.Context) *exec.Cmd {
-				return exec.CommandContext(ctx, path)
-			}, nil
-		}
-
-		// Otherwise, assume this is a valid shell command
-		shell := os.Getenv("SHELL")
-		if shell == "" {
-			return nil, fmt.Errorf("SHELL unset and mapper does not appear to be an executable")
-		}
-		return func(ctx context.Context) *exec.Cmd {
-			return exec.CommandContext(ctx, shell, "-c", prog)
-		}, nil
-	}()
-	if err != nil {
-		return nil, err
+	for _, o := range opts {
+		o(&options)
 	}
-
 	return func(ctx context.Context, stage MapStage, chunk []byte) ([]mapResult, error) {
-		defaultPath := filepath.Join(stage.Dir, "default")
-		lf := &lazyFile{name: defaultPath}
-		defer lf.Close()
+		stdout, err := os.Create(filepath.Join(stage.Dir, "stdout"))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create output log file: %w", err)
+		}
+		defer stdout.Close()
 
-		cmd := base(ctx)
+		stderr, err := os.Create(filepath.Join(stage.Dir, "stderr"))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create error log file: %w", err)
+		}
+		defer stderr.Close()
+
+		cmd := fun(ctx)
 		cmd.Stdin = bytes.NewReader(chunk)
-		cmd.Stdout = lf
-		cmd.Stderr = os.Stderr
-		cmd.Dir = stage.Dir
+		cmd.Stdout = stdout
+		cmd.Stderr = stderr
+
+		env := os.Environ()
+		env = append(env, "LMR_RESULTS_DIR="+stage.ResultsDir)
+		cmd.Env = env
 
 		if err := cmd.Run(); err != nil {
 			return nil, err
 		}
 
+		if options.DefaultKey != "" {
+			stdout.Close()
+			if err := os.Link(stdout.Name(), filepath.Join(stage.ResultsDir, options.DefaultKey)); err != nil {
+				return nil, fmt.Errorf("failed to produce default output: %w", err)
+			}
+		}
+
 		// Lazy file produces a valid output if used, so we can just rely
 		// on regular stage collection.
 		return stage.CollectResults()
-	}, nil
+	}
 }
 
 type reduceFunc func(key string, paths []string, out io.Writer) error
@@ -271,9 +297,10 @@ func (r *runner) Run(ctx context.Context, c Chunker) error {
 				ID:  stageID,
 				Dir: filepath.Join(root, stageID),
 			}
-			if err := os.Mkdir(stage.Dir, 0o777); err != nil {
-				return fmt.Errorf("failed to create map stage: %w", err)
+			if err := stage.init(); err != nil {
+				return err
 			}
+
 			out, err := r.mapper(egCtx, stage, chunk)
 			if err != nil {
 				return err
@@ -320,10 +347,12 @@ func main() {
 				return fmt.Errorf("too many command line arguments")
 			}
 
-			mapper, err := execMapper(args[0])
+			execFun, err := parseExec(args[0])
 			if err != nil {
 				return err
 			}
+
+			mapper := execMapper(execFun)
 			reducer := concatReducer
 			chunker := lineChunker{bufio.NewScanner(os.Stdin)}
 
