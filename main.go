@@ -2,7 +2,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/base32"
@@ -18,6 +17,8 @@ import (
 
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/joshkunz/lmr/chunker"
 )
 
 type mapResult struct {
@@ -197,32 +198,6 @@ type limit struct {
 
 var unlimited = limit{unlimited: true}
 
-type Chunker interface {
-	HasNext() bool
-	Next() []byte
-	Err() error
-}
-
-type lineChunker struct {
-	scan *bufio.Scanner
-}
-
-var _ Chunker = lineChunker{}
-
-func (l lineChunker) HasNext() bool {
-	return l.scan.Scan()
-}
-
-func (l lineChunker) Next() []byte {
-	// Specifically using Text here so we get a new chunk. Bytes may be
-	// overwritten between calls.
-	return []byte(l.scan.Text())
-}
-
-func (l lineChunker) Err() error {
-	return l.scan.Err()
-}
-
 type runner struct {
 	mapper  mapFunc
 	reducer reduceFunc
@@ -261,7 +236,7 @@ func (r *runner) mapID() string {
 	return "map_" + base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(raw)
 }
 
-func (r *runner) Run(ctx context.Context, c Chunker) error {
+func (r *runner) Run(ctx context.Context, c chunker.Chunker) error {
 	root, err := r.newRoot()
 	if err != nil {
 		return err
@@ -354,7 +329,7 @@ func main() {
 
 			mapper := execMapper(execFun)
 			reducer := concatReducer
-			chunker := lineChunker{bufio.NewScanner(os.Stdin)}
+			chunker := chunker.NewLine(os.Stdin)
 
 			r := runner{
 				mapper:  mapper,
